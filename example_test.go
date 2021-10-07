@@ -1,8 +1,10 @@
-package circuitbreaker
+package circuit
 
 import (
 	"fmt"
+
 	"github.com/peterbourgon/g2s"
+
 	"io/ioutil"
 	"log"
 	"time"
@@ -14,7 +16,7 @@ func ExampleThresholdBreaker() {
 	// returned by remoteCall, unless the breaker has been tripped, in which case
 	// it will return ErrBreakerOpen.
 	breaker := NewThresholdBreaker(10)
-	err := breaker.Call(remoteCall)
+	err := breaker.Call(remoteCall, 0)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -30,7 +32,7 @@ func ExampleThresholdBreaker_manual() {
 			breaker.Fail()
 			log.Fatal(err)
 		} else {
-			breaker.Reset()
+			breaker.Success()
 		}
 	}
 }
@@ -41,18 +43,18 @@ func ExampleTimeoutBreaker() {
 	// by Call() will be the error returned by remoteCall with two exceptions: if
 	// remoteCall takes longer than one second the return value will be ErrBreakerTimeout,
 	// if the breaker has been tripped the return value will be ErrBreakerOpen.
-	breaker := NewTimeoutBreaker(time.Second, 10)
-	err := breaker.Call(remoteCall)
+	breaker := NewThresholdBreaker(10)
+	err := breaker.Call(remoteCall, time.Second)
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func ExampleFrequencyBreaker() {
+func ExampleConsecutiveBreaker() {
 	// This example sets up a FrequencyBreaker that will trip if remoteCall returns
 	// an error 10 times in a row within a period of 2 minutes.
-	breaker := NewFrequencyBreaker(time.Minute*2, 10)
-	err := breaker.Call(remoteCall)
+	breaker := NewConsecutiveBreaker(10)
+	err := breaker.Call(remoteCall, 0)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -75,7 +77,7 @@ func ExampleHTTPClient() {
 	fmt.Printf("%s", resource)
 }
 
-func ExampleCircuitBreaker_events() {
+func ExampleBreaker_events() {
 	// This example demonstrates the BreakerTripped and BreakerReset callbacks. These are
 	// available on all breaker types.
 	breaker := NewThresholdBreaker(1)
@@ -104,24 +106,24 @@ func ExampleCircuitBreaker_events() {
 func ExamplePanel() {
 	// This example demonstrates using a Panel to aggregate and manage circuit breakers.
 	breaker1 := NewThresholdBreaker(10)
-	breaker2 := NewFrequencyBreaker(time.Minute, 10)
+	breaker2 := NewRateBreaker(0.95, 100)
 
 	panel := NewPanel()
 	panel.Add("breaker1", breaker1)
 	panel.Add("breaker2", breaker2)
 
 	// Elsewhere in the code ...
-	b1 := panel.Get("breaker1")
+	b1, _ := panel.Get("breaker1")
 	b1.Call(func() error {
 		// Do some work
 		return nil
-	})
+	}, 0)
 
-	b2 := panel.Get("breaker2")
+	b2, _ := panel.Get("breaker2")
 	b2.Call(func() error {
 		// Do some work
 		return nil
-	})
+	}, 0)
 }
 
 func ExamplePanel_stats() {

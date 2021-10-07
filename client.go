@@ -4,40 +4,88 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
+	"time"
 )
 
-type HttpClient struct {
-	Client        *http.Client
-	BreakerOpen   func(error)
-	BreakerClosed func()
-	cb            *CircuitBreaker
+// HTTPClient is a wrapper around http.Client that provides circuit breaker capabilities.
+//
+// By default, the client will use its defaultBreaker. A BreakerLookup function may be
+// provided to allow different breakers to be used based on the circumstance. See the
+// implementation of NewHostBasedHTTPClient for an example of this.
+type HTTPClient struct {
+	Client         *http.Client
+	BreakerTripped func()
+	BreakerReset   func()
+	BreakerLookup  func(*HTTPClient, interface{}) *TimeoutBreaker
+	defaultBreaker *TimeoutBreaker
+	breakers       map[interface{}]*TimeoutBreaker
+	breakerLock    sync.Mutex
 }
 
-func NewCircuitBreakerClient(timeout, threshold int, client *http.Client) *HttpClient {
+// NewCircuitBreakerClient provides a circuit breaker wrapper around http.Client.
+// It wraps all of the regular http.Client functions. Specifying 0 for timeout will
+// give a breaker that does not check for time outs.
+func NewHTTPClient(timeout time.Duration, threshold int64, client *http.Client) *HTTPClient {
 	if client == nil {
 		client = &http.Client{}
 	}
 
-	breaker := NewTimeoutCircuitBreaker(timeout, threshold)
-	brclient := &HttpClient{Client: client, cb: breaker}
-	breaker.BreakerOpen = brclient.runBreakerOpen
-	breaker.BreakerClosed = brclient.runBreakerClosed
+	breaker := NewTimeoutBreaker(timeout, threshold)
+	breakers := make(map[interface{}]*TimeoutBreaker, 0)
+	brclient := &HTTPClient{Client: client, defaultBreaker: breaker, breakers: breakers}
+	breaker.BreakerTripped = brclient.runBreakerTripped
+	breaker.BreakerReset = brclient.runBreakerReset
 	return brclient
 }
 
-func (c *HttpClient) Do(req *http.Request) (*http.Response, error) {
+// NewHostBasedHTTPClient provides a circuit breaker wrapper around http.Client. This
+// client will use one circuit breaker per host parsed from the request URL. This allows
+// you to use a single HTTPClient for multiple hosts with one host's breaker not affecting
+// the other hosts.
+func NewHostBasedHTTPClient(timeout time.Duration, threshold int64, client *http.Client) *HTTPClient {
+	brclient := NewHTTPClient(timeout, threshold, client)
+
+	brclient.BreakerLookup = func(c *HTTPClient, val interface{}) *TimeoutBreaker {
+		rawURL := val.(string)
+		parsedURL, err := url.Parse(rawURL)
+		if err != nil {
+			return c.defaultBreaker
+		}
+		host := parsedURL.Host
+
+		c.breakerLock.Lock()
+		defer c.breakerLock.Unlock()
+		cb, ok := c.breakers[host]
+		if !ok {
+			cb = NewTimeoutBreaker(timeout, threshold)
+			cb.BreakerTripped = brclient.runBreakerTripped
+			cb.BreakerReset = brclient.runBreakerReset
+			c.breakers[host] = cb
+		}
+		return cb
+	}
+
+	return brclient
+}
+
+// Do wraps http.Client Do()
+func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 	var resp *http.Response
 	var err error
-	c.cb.Call(func() error {
+	breaker := c.breakerLookup(req.URL.String())
+	breaker.Call(func() error {
 		resp, err = c.Client.Do(req)
 		return err
 	})
 	return resp, err
 }
 
-func (c *HttpClient) Get(url string) (*http.Response, error) {
+// Get wraps http.Client Get()
+func (c *HTTPClient) Get(url string) (*http.Response, error) {
 	var resp *http.Response
-	err := c.cb.Call(func() error {
+	breaker := c.breakerLookup(url)
+	err := breaker.Call(func() error {
 		aresp, err := c.Client.Get(url)
 		resp = aresp
 		return err
@@ -45,9 +93,11 @@ func (c *HttpClient) Get(url string) (*http.Response, error) {
 	return resp, err
 }
 
-func (c *HttpClient) Head(url string) (*http.Response, error) {
+// Head wraps http.Client Head()
+func (c *HTTPClient) Head(url string) (*http.Response, error) {
 	var resp *http.Response
-	err := c.cb.Call(func() error {
+	breaker := c.breakerLookup(url)
+	err := breaker.Call(func() error {
 		aresp, err := c.Client.Head(url)
 		resp = aresp
 		return err
@@ -55,9 +105,11 @@ func (c *HttpClient) Head(url string) (*http.Response, error) {
 	return resp, err
 }
 
-func (c *HttpClient) Post(url string, bodyType string, body io.Reader) (*http.Response, error) {
+// Post wraps http.Client Post()
+func (c *HTTPClient) Post(url string, bodyType string, body io.Reader) (*http.Response, error) {
 	var resp *http.Response
-	err := c.cb.Call(func() error {
+	breaker := c.breakerLookup(url)
+	err := breaker.Call(func() error {
 		aresp, err := c.Client.Post(url, bodyType, body)
 		resp = aresp
 		return err
@@ -65,9 +117,11 @@ func (c *HttpClient) Post(url string, bodyType string, body io.Reader) (*http.Re
 	return resp, err
 }
 
-func (c *HttpClient) PostForm(url string, data url.Values) (*http.Response, error) {
+// PostForm wraps http.Client PostForm()
+func (c *HTTPClient) PostForm(url string, data url.Values) (*http.Response, error) {
 	var resp *http.Response
-	err := c.cb.Call(func() error {
+	breaker := c.breakerLookup(url)
+	err := breaker.Call(func() error {
 		aresp, err := c.Client.PostForm(url, data)
 		resp = aresp
 		return err
@@ -75,14 +129,21 @@ func (c *HttpClient) PostForm(url string, data url.Values) (*http.Response, erro
 	return resp, err
 }
 
-func (c *HttpClient) runBreakerOpen(cb *CircuitBreaker, err error) {
-	if c.BreakerOpen != nil {
-		c.BreakerOpen(err)
+func (c *HTTPClient) breakerLookup(val interface{}) *TimeoutBreaker {
+	if c.BreakerLookup != nil {
+		return c.BreakerLookup(c, val)
+	}
+	return c.defaultBreaker
+}
+
+func (c *HTTPClient) runBreakerTripped() {
+	if c.BreakerTripped != nil {
+		c.BreakerTripped()
 	}
 }
 
-func (c *HttpClient) runBreakerClosed(cb *CircuitBreaker) {
-	if c.BreakerClosed != nil {
-		c.BreakerClosed()
+func (c *HTTPClient) runBreakerReset() {
+	if c.BreakerReset != nil {
+		c.BreakerReset()
 	}
 }

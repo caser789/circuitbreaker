@@ -2,19 +2,19 @@ package circuitbreaker
 
 import (
 	"errors"
+	"sync/atomic"
 	"time"
 )
 
 type CircuitBreaker struct {
 	Timeout       int
-	Threshold     int
+	Threshold     int64
 	ResetTimeout  time.Duration
 	BreakerOpen   func(*CircuitBreaker, error)
 	BreakerClosed func(*CircuitBreaker)
-	failures      int
+	failures      int64
 	lastFailure   time.Time
-	halfOpenGate  int
-	halfOpens     int
+	halfOpens     int64
 }
 
 type circuit func() error
@@ -28,7 +28,7 @@ const (
 
 var (
 	BreakerOpen    = errors.New("breaker open")
-	BreakerTimeout = errors.New("breaker timeout")
+	BreakerTimeout = errors.New("breaker time out")
 )
 
 func NewCircuitBreaker(threshold int) *CircuitBreaker {
@@ -38,7 +38,7 @@ func NewCircuitBreaker(threshold int) *CircuitBreaker {
 func NewTimeoutCircuitBreaker(timeout, threshold int) *CircuitBreaker {
 	return &CircuitBreaker{
 		Timeout:      timeout,
-		Threshold:    threshold,
+		Threshold:    int64(threshold),
 		ResetTimeout: time.Millisecond * 500}
 }
 
@@ -58,9 +58,9 @@ func (cb *CircuitBreaker) Call(circuit circuit) error {
 
 	if err != nil {
 		if state == half_open {
-			cb.halfOpens = 0
+			atomic.StoreInt64(&cb.halfOpens, 0)
 		}
-		cb.failures += 1
+		atomic.AddInt64(&cb.failures, 1)
 		cb.lastFailure = time.Now()
 
 		if cb.BreakerOpen != nil && cb.failures == cb.Threshold {
@@ -73,8 +73,8 @@ func (cb *CircuitBreaker) Call(circuit circuit) error {
 		cb.BreakerClosed(cb)
 	}
 
-	cb.failures = 0
-	cb.halfOpens = 0
+	atomic.StoreInt64(&cb.failures, 0)
+	atomic.StoreInt64(&cb.halfOpens, 0)
 	return nil
 }
 
@@ -97,8 +97,8 @@ func (cb *CircuitBreaker) state() state {
 	if cb.failures >= cb.Threshold {
 		since := time.Since(cb.lastFailure)
 		if since > cb.ResetTimeout {
-			if cb.halfOpens <= cb.halfOpenGate {
-				cb.halfOpens += 1
+			if cb.halfOpens == 0 {
+				atomic.AddInt64(&cb.halfOpens, 1)
 				return half_open
 			} else {
 				return open
